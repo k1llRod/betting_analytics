@@ -1,0 +1,508 @@
+# src/views/streamlit_view.py
+from datetime import datetime
+from pathlib import Path
+import sys
+from typing import Dict, List, Optional
+import unicodedata
+
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+import pandas as pd
+import streamlit as st
+from src.controllers import SimulationController
+from src.models.database import SessionLocal
+from src.models.entities import BetLog, Match
+from src.services.backroll_service import BankrollService
+from src.services.micasino_scraper import MiCasinoScraper
+from src.services.poisson_model import PoissonPredictor
+
+# --- CATÁLOGO MULTILIGAS ---
+LEAGUE_CONFIG = {
+    "LaLiga (España)": {
+        "champ_id": 2941,
+        "db_key": "LA_LIGA",
+    },
+    "Premier League (Inglaterra)": {
+        "champ_id": 2936,
+        "db_key": "PREMIER_LEAGUE",
+    },
+    "División Profesional (Bolivia)": {
+        "champ_id": 40282,
+        "db_key": "BOLIVIA",
+    },
+    "Champions League": {
+        "champ_id": 16808,
+        "db_key": "LA_LIGA",  # Cruza equipos disponibles en base
+    },
+}
+
+
+def clean_str(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("utf-8")
+    return s.strip().upper()
+
+
+def match_team_name(scraped_name: str, db_teams: List[str]) -> Optional[str]:
+    s_norm = clean_str(scraped_name)
+    db_norm_map = {clean_str(t): t for t in db_teams}
+
+    if s_norm in db_norm_map:
+        return db_norm_map[s_norm]
+
+    # Diccionario unificado de alias (España, Inglaterra, Bolivia)
+    aliases = {
+        # España
+        "FC BARCELONA": "BARCELONA",
+        "REAL MADRID CF": "REAL MADRID",
+        "ATLETICO DE MADRID": "ATH MADRID",
+        "ATLETICO MADRID": "ATH MADRID",
+        "ATHLETIC CLUB": "ATH BILBAO",
+        "ATHLETIC BILBAO": "ATH BILBAO",
+        "REAL BETIS": "BETIS",
+        "REAL BETIS BALOMPIE": "BETIS",
+        "CA OSASUNA": "OSASUNA",
+        "RCD ESPANYOL": "ESPANYOL",
+        "RCD ESPANYOL BARCELONA": "ESPANYOL",
+        "RCD MALLORCA": "MALLORCA",
+        "VALENCIA CF": "VALENCIA",
+        "SEVILLA FC": "SEVILLA",
+        "VILLARREAL CF": "VILLARREAL",
+        "CELTA DE VIGO": "CELTA",
+        "RC CELTA DE VIGO": "CELTA",
+        "RAYO VALLECANO": "VALLECANO",
+        "REAL SOCIEDAD": "SOCIEDAD",
+        "GIRONA FC": "GIRONA",
+        "GETAFE CF": "GETAFE",
+        "UD LAS PALMAS": "LAS PALMAS",
+        "CD ALAVES": "ALAVES",
+        "DEPORTIVO ALAVES": "ALAVES",
+        "CD LEGANES": "LEGANES",
+        "REAL VALLADOLID": "VALLADOLID",
+        # Inglaterra
+        "MANCHESTER UNITED": "MAN UNITED",
+        "MANCHESTER CITY": "MAN CITY",
+        "NEWCASTLE UNITED": "NEWCASTLE",
+        "TOTTENHAM HOTSPUR": "TOTTENHAM",
+        "WOLVERHAMPTON WANDERERS": "WOLVES",
+        "NOTTINGHAM FOREST": "NOTTM FOREST",
+        "WEST HAM UNITED": "WEST HAM",
+        "BRIGHTON & HOVE ALBION": "BRIGHTON",
+        "LEICESTER CITY": "LEICESTER",
+        "IPSWICH TOWN": "IPSWICH",
+        # Bolivia
+        "CLUB BOLIVAR": "BOLIVAR",
+        "THE STRONGEST": "THE STRONGEST",
+        "CLUB ALWAYS READY": "ALWAYS READY",
+        "CD JORGE WILSTERMANN": "WILSTERMANN",
+        "CLUB AURORA": "AURORA",
+        "ORIENTE PETROLERO": "ORIENTE PETROLERO",
+        "BLOOMING": "BLOOMING",
+        "NACIONAL POTOSI": "NACIONAL POTOSI",
+    }
+
+    if s_norm in aliases:
+        target = aliases[s_norm]
+        for db_clean, db_orig in db_norm_map.items():
+            if clean_str(target) == db_clean or target == db_orig:
+                return db_orig
+
+    for db_clean, db_orig in db_norm_map.items():
+        if db_clean in s_norm or s_norm in db_clean:
+            return db_orig
+
+    return None
+
+
+def calculate_quarter_kelly(
+        p_model: float, odds: float, bankroll: float, fraction: float = 0.25
+) -> float:
+    b = odds - 1.0
+    q = 1.0 - p_model
+    f = (b * p_model - q) / b
+    if f <= 0:
+        return 0.0
+    return round(bankroll * f * fraction, 2)
+
+
+# --- DASHBOARD PRINCIPAL ---
+def render_dashboard():
+    st.set_page_config(
+        page_title="Betting Analytics - Quantitative Engine",
+        page_icon="📈",
+        layout="wide",
+    )
+
+    st.title("🎯 Motor Cuantitativo & Radar Multiliga (+EV)")
+    st.caption(
+        "Dixon-Coles Bivariado • API Altenar (MiCasino) • Gestión de Capital Kelly"
+    )
+
+    tab_radar, tab_simulator, tab_tracker = st.tabs(
+        ["🚨 Radar en Vivo (+EV)", "🔍 Simulador Individual", "📊 Bankroll Tracker (P&L)"]
+    )
+
+    # ==========================================
+    # PESTAÑA 1: RADAR EN VIVO MULTILIGA
+    # ==========================================
+    with tab_radar:
+        st.subheader("Radar de Oportunidades en Tiempo Real")
+
+        r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+        with r_col1:
+            league_choice = st.selectbox(
+                "Torneo a Escanear",
+                options=list(LEAGUE_CONFIG.keys()),
+                index=0,
+            )
+            selected_config = LEAGUE_CONFIG[league_choice]
+            champ_id = selected_config["champ_id"]
+            db_league_key = selected_config["db_key"]
+
+        with r_col2:
+            min_edge_input = st.slider(
+                "Edge Mínimo Requerido (%)", 1.0, 10.0, 3.0, 0.5
+            )
+        with r_col3:
+            max_odds_limit = st.number_input(
+                "Cuota Máxima Permitida", 2.0, 30.0, 15.0, 1.0
+            )
+        with r_col4:
+            bankroll = st.number_input("Bankroll Total ($)", 50.0, 10000.0, 500.0, 50.0)
+
+        # Estado en sesión para persistir resultados
+        if "scan_opportunities" not in st.session_state:
+            st.session_state["scan_opportunities"] = []
+        if "last_scanned_league" not in st.session_state:
+            st.session_state["last_scanned_league"] = ""
+
+        if st.button(
+                f"🚀 Escanear {league_choice}", use_container_width=True, type="primary"
+        ):
+            with st.spinner(
+                    f"Consultando líneas de MiCasino para {league_choice} y calculando matrices Dixon-Coles..."
+            ):
+                db = SessionLocal()
+                try:
+                    db_teams = [
+                        t[0]
+                        for t in db.query(Match.home_team)
+                        .filter(Match.league == db_league_key)
+                        .distinct()
+                        .all()
+                    ]
+
+                    if not db_teams:
+                        st.warning(
+                            f"No se encontraron partidos históricos para la liga '{db_league_key}' en PostgreSQL. Ejecuta la ingesta previa."
+                        )
+                        st.session_state["scan_opportunities"] = []
+                    else:
+                        scraper = MiCasinoScraper()
+                        markets = scraper.fetch_championship_events(champ_id=champ_id)
+
+                        if not markets:
+                            st.warning(
+                                f"No se obtuvieron cuotas activas para {league_choice} en MiCasino en este momento."
+                            )
+                            st.session_state["scan_opportunities"] = []
+                        else:
+                            predictor = PoissonPredictor(db)
+                            controller = SimulationController(min_edge=min_edge_input / 100.0)
+
+                            events = {}
+                            for m in markets:
+                                events.setdefault(m.event_name, []).append(m)
+
+                            ops = []
+                            for event_name, event_markets in events.items():
+                                first = event_markets[0]
+                                h_team = match_team_name(first.home_team, db_teams)
+                                a_team = match_team_name(first.away_team, db_teams)
+
+                                if not h_team or not a_team:
+                                    continue
+
+                                try:
+                                    probs = predictor.predict_match(
+                                        league=db_league_key, home_team=h_team, away_team=a_team
+                                    )
+                                except Exception:
+                                    continue
+
+                                for m in event_markets:
+                                    if m.price > max_odds_limit:
+                                        continue
+
+                                    p_model = None
+                                    label = ""
+
+                                    if m.market_type == "1X2":
+                                        if m.selection == "HOME":
+                                            p_model = probs.home_win
+                                            label = f"Gana Local ({h_team})"
+                                        elif m.selection == "DRAW":
+                                            p_model = probs.draw
+                                            label = "Empate (X)"
+                                        elif m.selection == "AWAY":
+                                            p_model = probs.away_win
+                                            label = f"Gana Visitante ({a_team})"
+                                    elif m.market_type == "TOTAL_GOALS" and m.line == 2.5:
+                                        if m.selection == "OVER":
+                                            p_model = probs.over_2_5_goals
+                                            label = "Más de 2.5 Goles"
+                                        elif m.selection == "UNDER":
+                                            p_model = probs.under_2_5_goals
+                                            label = "Menos de 2.5 Goles"
+
+                                    if p_model is None:
+                                        continue
+
+                                    res = controller.evaluate_market(
+                                        market_name=label,
+                                        p_model=p_model,
+                                        odds=m.price,
+                                        stake=10.0,
+                                        custom_min_edge=min_edge_input / 100.0,
+                                    )
+
+                                    if res["is_value"] and res["p_model"] >= 0.08:
+                                        kelly_stake = calculate_quarter_kelly(
+                                            p_model=res["p_model"],
+                                            odds=res["odds"],
+                                            bankroll=bankroll,
+                                            fraction=0.25,
+                                        )
+                                        ops.append({
+                                            "Partido": f"{h_team} vs {a_team}",
+                                            "Mercado": res["market"],
+                                            "Cuota": f"{res['odds']:.2f}",
+                                            "Prob. Dixon-Coles": f"{res['p_model'] * 100:.1f}%",
+                                            "Prob. Casa": f"{res['p_implied'] * 100:.1f}%",
+                                            "Edge (+EV)": f"{res['edge'] * 100:+.2f}%",
+                                            "EV ($10)": f"${res['ev']:+.2f}",
+                                            "Stake Sugerido (1/4 Kelly)": f"${kelly_stake:.2f}",
+                                            "_raw": {
+                                                "odds": float(res["odds"]),
+                                                "p_model": float(res["p_model"]),
+                                                "edge": float(res["edge"]),
+                                                "kelly_stake": float(kelly_stake),
+                                            },
+                                        })
+
+                            st.session_state["scan_opportunities"] = ops
+                            st.session_state["last_scanned_league"] = league_choice
+                finally:
+                    db.close()
+
+        # Renderizado de resultados almacenados
+        stored_ops = st.session_state.get("scan_opportunities", [])
+        scanned_league = st.session_state.get("last_scanned_league", "")
+
+        if stored_ops:
+            display_data = [{k: v for k, v in o.items() if k != "_raw"} for o in stored_ops]
+            df_ops = pd.DataFrame(display_data)
+            st.success(
+                f"🎯 Se detectaron **{len(stored_ops)}** apuestas con Valor Esperado Positivo (+EV) en {scanned_league}"
+            )
+            st.dataframe(df_ops, use_container_width=True)
+
+            st.divider()
+            st.markdown("#### 📥 Registrar Apuesta en el Tracker")
+
+            # Formulario para agrupar selección y registro sin refresco prematuro
+            with st.form("form_register_bet"):
+                reg_col1, reg_col2 = st.columns([3, 1])
+
+                options_labels = [
+                    f"{o['Partido']} | {o['Mercado']} @ {o['Cuota']} (Stake Kelly: {o['Stake Sugerido (1/4 Kelly)']})"
+                    for o in stored_ops
+                ]
+
+                with reg_col1:
+                    selected_idx = st.selectbox(
+                        "Selecciona la oportunidad a tomar:",
+                        options=range(len(stored_ops)),
+                        format_func=lambda i: options_labels[i],
+                    )
+
+                picked_op = stored_ops[selected_idx]
+                raw_data = picked_op["_raw"]
+
+                with reg_col2:
+                    custom_stake = st.number_input(
+                        "Monto a Apostar ($):",
+                        min_value=1.0,
+                        max_value=float(bankroll),
+                        value=max(1.0, float(raw_data["kelly_stake"])),
+                        step=1.0,
+                    )
+
+                submit_btn = st.form_submit_button(
+                    "💾 Confirmar y Registrar Apuesta", type="primary", use_container_width=True
+                )
+
+                if submit_btn:
+                    db = SessionLocal()
+                    try:
+                        bk_service = BankrollService(db)
+                        new_bet = bk_service.place_bet(
+                            league=scanned_league,
+                            match_name=picked_op["Partido"],
+                            market=picked_op["Mercado"],
+                            odds=float(raw_data["odds"]),
+                            p_model=float(raw_data["p_model"]),
+                            edge=float(raw_data["edge"]),
+                            stake=float(custom_stake),
+                        )
+                        st.success(f"✅ ¡Apuesta #{new_bet.id} guardada en el Bankroll Tracker!")
+                    finally:
+                        db.close()
+
+    # ==========================================
+    # PESTAÑA 2: SIMULADOR INDIVIDUAL
+    # ==========================================
+    with tab_simulator:
+        st.subheader("Análisis Particular de Encuentro")
+        db = SessionLocal()
+        try:
+            leagues = [row[0] for row in db.query(Match.league).distinct().all()]
+            selected_lg = st.selectbox("Liga a Simular", options=leagues)
+            teams = sorted(
+                list(
+                    set(
+                        [
+                            row[0]
+                            for row in db.query(Match.home_team)
+                        .filter(Match.league == selected_lg)
+                        .distinct()
+                        .all()
+                        ]
+                        + [
+                            row[0]
+                            for row in db.query(Match.away_team)
+                        .filter(Match.league == selected_lg)
+                        .distinct()
+                        .all()
+                        ]
+                    )
+                )
+            )
+        finally:
+            db.close()
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            h_sel = st.selectbox("Local", options=teams, index=0 if teams else None)
+        with sc2:
+            a_opts = [t for t in teams if t != h_sel]
+            a_sel = st.selectbox(
+                "Visitante", options=a_opts, index=0 if a_opts else None
+            )
+
+        if h_sel and a_sel:
+            db = SessionLocal()
+            try:
+                predictor = PoissonPredictor(db)
+                pr = predictor.predict_match(
+                    league=selected_lg, home_team=h_sel, away_team=a_sel
+                )
+            finally:
+                db.close()
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric(f"Victoria {h_sel}", f"{pr.home_win * 100:.1f}%")
+            mc2.metric("Empate", f"{pr.draw * 100:.1f}%")
+            mc3.metric(f"Victoria {a_sel}", f"{pr.away_win * 100:.1f}%")
+            mc4.metric("Más de 2.5 Goles", f"{pr.over_2_5_goals * 100:.1f}%")
+
+    # ==========================================
+    # PESTAÑA 3: BANKROLL TRACKER (P&L)
+    # ==========================================
+    with tab_tracker:
+        st.subheader("Seguimiento Cuantitativo de Rendimiento (P&L)")
+
+        db = SessionLocal()
+        try:
+            bk_service = BankrollService(db)
+            metrics = bk_service.get_summary_metrics()
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("P&L Total", f"${metrics['total_profit_loss']:+,.2f}")
+            m2.metric("Yield / ROI", f"{metrics['yield_pct']:+.2f}%")
+            m3.metric("Win Rate", f"{metrics['win_rate']:.1f}%")
+            m4.metric(
+                "Apuestas (Cerradas / Activas)",
+                f"{metrics['resolved_bets']} / {metrics['pending_bets']}",
+            )
+
+            st.divider()
+
+            # Formulario para liquidar apuestas pendientes (con soporte para Closing Odds y CLV)
+            pending_bets = (
+                db.query(BetLog).filter(BetLog.status == "PENDING").all()
+            )
+            if pending_bets:
+                st.write("#### ⏳ Liquidar Apuestas Pendientes")
+                p_col1, p_col2, p_col3, p_col4 = st.columns([3, 1.5, 1.5, 2])
+                with p_col1:
+                    bet_to_resolve = st.selectbox(
+                        "Seleccionar Apuesta",
+                        options=pending_bets,
+                        format_func=lambda b: (
+                            f"#{b.id} | {b.match_name} - {b.market} @ {b.odds} (${b.stake})"
+                        ),
+                    )
+                with p_col2:
+                    outcome = st.selectbox(
+                        "Resultado", options=["WON", "LOST", "VOID"], index=0
+                    )
+                with p_col3:
+                    default_closing = float(bet_to_resolve.odds) if bet_to_resolve else 2.0
+                    closing_val = st.number_input(
+                        "Cuota de Cierre (Opcional):",
+                        min_value=1.0,
+                        max_value=50.0,
+                        value=default_closing,
+                        step=0.01,
+                    )
+                with p_col4:
+                    st.write("")
+                    st.write("")
+                    if st.button("Guardar Resultado", type="primary", use_container_width=True):
+                        bk_service.resolve_bet(
+                            bet_id=bet_to_resolve.id,
+                            outcome=outcome,
+                            closing_odds=closing_val,
+                        )
+                        st.success(
+                            f"Apuesta #{bet_to_resolve.id} liquidada como {outcome} (Cierre: @{closing_val})"
+                        )
+                        st.rerun()
+
+            # Tabla de Historial
+            st.write("#### 📋 Historial de Apuestas")
+            df_hist = bk_service.get_history_dataframe()
+            if not df_hist.empty:
+                st.dataframe(df_hist, use_container_width=True)
+
+                resolved_df = (
+                    df_hist[df_hist["Estado"].isin(["WON", "LOST"])]
+                    .iloc[::-1]
+                    .copy()
+                )
+                if not resolved_df.empty:
+                    resolved_df["P&L Acumulado"] = resolved_df["P&L ($)"].cumsum()
+                    st.line_chart(
+                        resolved_df.set_index("Fecha")["P&L Acumulado"],
+                        use_container_width=True,
+                    )
+            else:
+                st.info("No hay apuestas registradas en la base de datos todavía.")
+        finally:
+            db.close()
+
+
+if __name__ == "__main__":
+    render_dashboard()
