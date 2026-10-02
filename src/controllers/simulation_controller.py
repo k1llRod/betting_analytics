@@ -21,6 +21,18 @@ class SimulationController:
         threshold = (
             custom_min_edge if custom_min_edge is not None else self.min_edge
         )
+        if odds <= 1.0:
+            return {
+                "market": market_name,
+                "p_model": p_model,
+                "odds": odds,
+                "stake": stake,
+                "p_implied": 1.0,
+                "edge": 0.0,
+                "ev": -stake,
+                "is_value": False,
+                "threshold": threshold,
+            }
         p_implied = self.calculator.implied_probability(odds)
         edge = p_model - p_implied
         ev = self.calculator.calculate_ev(p_model, odds, stake=stake)

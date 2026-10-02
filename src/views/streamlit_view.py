@@ -13,117 +13,14 @@ import pandas as pd
 import streamlit as st
 from src.controllers import SimulationController
 from src.models.database import SessionLocal
-from src.models.entities import BetLog, Match
+from src.models.entities import BetLog, Match, TeamParametersCache
 from src.services.backroll_service import BankrollService
+from src.services.closing_odds_service import ClosingOddsService
 from src.services.micasino_scraper import MiCasinoScraper
 from src.services.poisson_model import PoissonPredictor
+from src.services.result_settlement_service import ResultSettlementService
 
-# --- CATÁLOGO MULTILIGAS ---
-LEAGUE_CONFIG = {
-    "LaLiga (España)": {
-        "champ_id": 2941,
-        "db_key": "LA_LIGA",
-    },
-    "Premier League (Inglaterra)": {
-        "champ_id": 2936,
-        "db_key": "PREMIER_LEAGUE",
-    },
-    "División Profesional (Bolivia)": {
-        "champ_id": 40282,
-        "db_key": "BOLIVIA",
-    },
-    "Champions League": {
-        "champ_id": 16808,
-        "db_key": "LA_LIGA",  # Cruza equipos disponibles en base
-    },
-}
-
-
-def clean_str(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("utf-8")
-    return s.strip().upper()
-
-
-def match_team_name(scraped_name: str, db_teams: List[str]) -> Optional[str]:
-    s_norm = clean_str(scraped_name)
-    db_norm_map = {clean_str(t): t for t in db_teams}
-
-    if s_norm in db_norm_map:
-        return db_norm_map[s_norm]
-
-    # Diccionario unificado de alias (España, Inglaterra, Bolivia)
-    aliases = {
-        # España
-        "FC BARCELONA": "BARCELONA",
-        "REAL MADRID CF": "REAL MADRID",
-        "ATLETICO DE MADRID": "ATH MADRID",
-        "ATLETICO MADRID": "ATH MADRID",
-        "ATHLETIC CLUB": "ATH BILBAO",
-        "ATHLETIC BILBAO": "ATH BILBAO",
-        "REAL BETIS": "BETIS",
-        "REAL BETIS BALOMPIE": "BETIS",
-        "CA OSASUNA": "OSASUNA",
-        "RCD ESPANYOL": "ESPANYOL",
-        "RCD ESPANYOL BARCELONA": "ESPANYOL",
-        "RCD MALLORCA": "MALLORCA",
-        "VALENCIA CF": "VALENCIA",
-        "SEVILLA FC": "SEVILLA",
-        "VILLARREAL CF": "VILLARREAL",
-        "CELTA DE VIGO": "CELTA",
-        "RC CELTA DE VIGO": "CELTA",
-        "RAYO VALLECANO": "VALLECANO",
-        "REAL SOCIEDAD": "SOCIEDAD",
-        "GIRONA FC": "GIRONA",
-        "GETAFE CF": "GETAFE",
-        "UD LAS PALMAS": "LAS PALMAS",
-        "CD ALAVES": "ALAVES",
-        "DEPORTIVO ALAVES": "ALAVES",
-        "CD LEGANES": "LEGANES",
-        "REAL VALLADOLID": "VALLADOLID",
-        # Inglaterra
-        "MANCHESTER UNITED": "MAN UNITED",
-        "MANCHESTER CITY": "MAN CITY",
-        "NEWCASTLE UNITED": "NEWCASTLE",
-        "TOTTENHAM HOTSPUR": "TOTTENHAM",
-        "WOLVERHAMPTON WANDERERS": "WOLVES",
-        "NOTTINGHAM FOREST": "NOTTM FOREST",
-        "WEST HAM UNITED": "WEST HAM",
-        "BRIGHTON & HOVE ALBION": "BRIGHTON",
-        "LEICESTER CITY": "LEICESTER",
-        "IPSWICH TOWN": "IPSWICH",
-        # Bolivia
-        "CLUB BOLIVAR": "BOLIVAR",
-        "THE STRONGEST": "THE STRONGEST",
-        "CLUB ALWAYS READY": "ALWAYS READY",
-        "CD JORGE WILSTERMANN": "WILSTERMANN",
-        "CLUB AURORA": "AURORA",
-        "ORIENTE PETROLERO": "ORIENTE PETROLERO",
-        "BLOOMING": "BLOOMING",
-        "NACIONAL POTOSI": "NACIONAL POTOSI",
-    }
-
-    if s_norm in aliases:
-        target = aliases[s_norm]
-        for db_clean, db_orig in db_norm_map.items():
-            if clean_str(target) == db_clean or target == db_orig:
-                return db_orig
-
-    for db_clean, db_orig in db_norm_map.items():
-        if db_clean in s_norm or s_norm in db_clean:
-            return db_orig
-
-    return None
-
-
-def calculate_quarter_kelly(
-        p_model: float, odds: float, bankroll: float, fraction: float = 0.25
-) -> float:
-    b = odds - 1.0
-    q = 1.0 - p_model
-    f = (b * p_model - q) / b
-    if f <= 0:
-        return 0.0
-    return round(bankroll * f * fraction, 2)
+from src.utils import LEAGUE_CONFIG, calculate_quarter_kelly, clean_str, match_team_name
 
 
 # --- DASHBOARD PRINCIPAL ---
@@ -136,8 +33,39 @@ def render_dashboard():
 
     st.title("🎯 Motor Cuantitativo & Radar Multiliga (+EV)")
     st.caption(
-        "Dixon-Coles Bivariado • API Altenar (MiCasino) • Gestión de Capital Kelly"
+        "Dixon-Coles Bivariado • Decaimiento Temporal • Expected Goals (xG) • Mercados Avanzados • Auditoría CLV"
     )
+
+    # --- BARRA LATERAL: PARÁMETROS DEL MODELO DIXON-COLES ---
+    with st.sidebar:
+        st.header("⚙️ Calibración del Modelo")
+        xi_val = st.slider(
+            "Factor Decaimiento Temporal (ξ)",
+            min_value=0.0010,
+            max_value=0.0100,
+            value=0.0035,
+            step=0.0005,
+            format="%.4f",
+            help="ξ ≈ 0.0035 otorga mayor peso a los partidos recientes (~6 meses de vida media)",
+        )
+        xg_weight = st.slider(
+            "Ponderación Goles Esperados (xG)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.25,
+            step=0.05,
+            help="Combina xG con goles observados para reducir varianza en muestras cortas",
+        )
+        use_cache = st.checkbox("Activar Caché Persistente en DB", value=True)
+
+        if st.button("🗑️ Limpiar Caché de Parámetros"):
+            db = SessionLocal()
+            try:
+                db.query(TeamParametersCache).delete()
+                db.commit()
+                st.success("Caché limpiado correctamente.")
+            finally:
+                db.close()
 
     tab_radar, tab_simulator, tab_tracker = st.tabs(
         ["🚨 Radar en Vivo (+EV)", "🔍 Simulador Individual", "📊 Bankroll Tracker (P&L)"]
@@ -162,11 +90,11 @@ def render_dashboard():
 
         with r_col2:
             min_edge_input = st.slider(
-                "Edge Mínimo Requerido (%)", 1.0, 10.0, 3.0, 0.5
+                "Edge Mínimo Requerido (%)", 1.0, 10.0, 4.0, 0.5
             )
         with r_col3:
             max_odds_limit = st.number_input(
-                "Cuota Máxima Permitida", 2.0, 30.0, 15.0, 1.0
+                "Cuota Máxima Permitida", 1.5, 30.0, 4.0, 0.25
             )
         with r_col4:
             bankroll = st.number_input("Bankroll Total ($)", 50.0, 10000.0, 500.0, 50.0)
@@ -178,10 +106,10 @@ def render_dashboard():
             st.session_state["last_scanned_league"] = ""
 
         if st.button(
-                f"🚀 Escanear {league_choice}", use_container_width=True, type="primary"
+            f"🚀 Escanear {league_choice}", use_container_width=True, type="primary"
         ):
             with st.spinner(
-                    f"Consultando líneas de MiCasino para {league_choice} y calculando matrices Dixon-Coles..."
+                f"Consultando Altenar para {league_choice} y calculando probabilidades Dixon-Coles (ξ={xi_val})..."
             ):
                 db = SessionLocal()
                 try:
@@ -208,7 +136,9 @@ def render_dashboard():
                             )
                             st.session_state["scan_opportunities"] = []
                         else:
-                            predictor = PoissonPredictor(db)
+                            predictor = PoissonPredictor(
+                                db, xi=xi_val, xg_weight=xg_weight, use_cache=use_cache
+                            )
                             controller = SimulationController(min_edge=min_edge_input / 100.0)
 
                             events = {}
@@ -238,6 +168,7 @@ def render_dashboard():
                                     p_model = None
                                     label = ""
 
+                                    # 1. 1X2
                                     if m.market_type == "1X2":
                                         if m.selection == "HOME":
                                             p_model = probs.home_win
@@ -248,13 +179,42 @@ def render_dashboard():
                                         elif m.selection == "AWAY":
                                             p_model = probs.away_win
                                             label = f"Gana Visitante ({a_team})"
-                                    elif m.market_type == "TOTAL_GOALS" and m.line == 2.5:
-                                        if m.selection == "OVER":
-                                            p_model = probs.over_2_5_goals
-                                            label = "Más de 2.5 Goles"
-                                        elif m.selection == "UNDER":
-                                            p_model = probs.under_2_5_goals
-                                            label = "Menos de 2.5 Goles"
+
+                                    # 2. Total de Goles
+                                    elif m.market_type == "TOTAL_GOALS":
+                                        if m.line == 2.5:
+                                            p_model = probs.over_2_5_goals if m.selection == "OVER" else probs.under_2_5_goals
+                                            label = f"{'Más' if m.selection == 'OVER' else 'Menos'} de 2.5 Goles"
+                                        elif m.line == 1.5:
+                                            p_model = probs.over_1_5_goals if m.selection == "OVER" else probs.under_1_5_goals
+                                            label = f"{'Más' if m.selection == 'OVER' else 'Menos'} de 1.5 Goles"
+                                        elif m.line == 3.5:
+                                            p_model = probs.over_3_5_goals if m.selection == "OVER" else probs.under_3_5_goals
+                                            label = f"{'Más' if m.selection == 'OVER' else 'Menos'} de 3.5 Goles"
+
+                                    # 3. Ambos Equipos Marcan (BTTS)
+                                    elif m.market_type == "BTTS":
+                                        if m.selection == "YES":
+                                            p_model = probs.btts_yes
+                                            label = "Ambos Marcan (Sí)"
+                                        elif m.selection == "NO":
+                                            p_model = probs.btts_no
+                                            label = "Ambos Marcan (No)"
+
+                                    # 4. Apuesta Sin Empate (AH 0.0)
+                                    elif m.market_type == "DRAW_NO_BET":
+                                        if m.selection == "HOME":
+                                            p_model = probs.draw_no_bet["HOME"]
+                                            label = f"Sin Empate ({h_team})"
+                                        elif m.selection == "AWAY":
+                                            p_model = probs.draw_no_bet["AWAY"]
+                                            label = f"Sin Empate ({a_team})"
+
+                                    # 5. Doble Oportunidad (AH +0.5)
+                                    elif m.market_type == "DOUBLE_CHANCE":
+                                        if m.selection in probs.double_chance:
+                                            p_model = probs.double_chance[m.selection]
+                                            label = f"Doble Oportunidad ({m.selection})"
 
                                     if p_model is None:
                                         continue
@@ -267,7 +227,7 @@ def render_dashboard():
                                         custom_min_edge=min_edge_input / 100.0,
                                     )
 
-                                    if res["is_value"] and res["p_model"] >= 0.08:
+                                    if res["is_value"] and res["p_model"] >= 0.10:
                                         kelly_stake = calculate_quarter_kelly(
                                             p_model=res["p_model"],
                                             odds=res["odds"],
@@ -288,6 +248,7 @@ def render_dashboard():
                                                 "p_model": float(res["p_model"]),
                                                 "edge": float(res["edge"]),
                                                 "kelly_stake": float(kelly_stake),
+                                                "kickoff_time": first.start_date,
                                             },
                                         })
 
@@ -296,7 +257,7 @@ def render_dashboard():
                 finally:
                     db.close()
 
-        # Renderizado de resultados almacenados
+        # Renderizado de resultados
         stored_ops = st.session_state.get("scan_opportunities", [])
         scanned_league = st.session_state.get("last_scanned_league", "")
 
@@ -311,7 +272,6 @@ def render_dashboard():
             st.divider()
             st.markdown("#### 📥 Registrar Apuesta en el Tracker")
 
-            # Formulario para agrupar selección y registro sin refresco prematuro
             with st.form("form_register_bet"):
                 reg_col1, reg_col2 = st.columns([3, 1])
 
@@ -355,6 +315,7 @@ def render_dashboard():
                             p_model=float(raw_data["p_model"]),
                             edge=float(raw_data["edge"]),
                             stake=float(custom_stake),
+                            kickoff_time=raw_data.get("kickoff_time"),
                         )
                         st.success(f"✅ ¡Apuesta #{new_bet.id} guardada en el Bankroll Tracker!")
                     finally:
@@ -364,7 +325,7 @@ def render_dashboard():
     # PESTAÑA 2: SIMULADOR INDIVIDUAL
     # ==========================================
     with tab_simulator:
-        st.subheader("Análisis Particular de Encuentro")
+        st.subheader("Análisis Particular de Encuentro & Desglose Multimercado")
         db = SessionLocal()
         try:
             leagues = [row[0] for row in db.query(Match.league).distinct().all()]
@@ -375,16 +336,16 @@ def render_dashboard():
                         [
                             row[0]
                             for row in db.query(Match.home_team)
-                        .filter(Match.league == selected_lg)
-                        .distinct()
-                        .all()
+                            .filter(Match.league == selected_lg)
+                            .distinct()
+                            .all()
                         ]
                         + [
                             row[0]
                             for row in db.query(Match.away_team)
-                        .filter(Match.league == selected_lg)
-                        .distinct()
-                        .all()
+                            .filter(Match.league == selected_lg)
+                            .distinct()
+                            .all()
                         ]
                     )
                 )
@@ -397,31 +358,47 @@ def render_dashboard():
             h_sel = st.selectbox("Local", options=teams, index=0 if teams else None)
         with sc2:
             a_opts = [t for t in teams if t != h_sel]
-            a_sel = st.selectbox(
-                "Visitante", options=a_opts, index=0 if a_opts else None
-            )
+            a_sel = st.selectbox("Visitante", options=a_opts, index=0 if a_opts else None)
 
         if h_sel and a_sel:
             db = SessionLocal()
             try:
-                predictor = PoissonPredictor(db)
+                predictor = PoissonPredictor(
+                    db, xi=xi_val, xg_weight=xg_weight, use_cache=use_cache
+                )
                 pr = predictor.predict_match(
                     league=selected_lg, home_team=h_sel, away_team=a_sel
                 )
             finally:
                 db.close()
 
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric(f"Victoria {h_sel}", f"{pr.home_win * 100:.1f}%")
-            mc2.metric("Empate", f"{pr.draw * 100:.1f}%")
-            mc3.metric(f"Victoria {a_sel}", f"{pr.away_win * 100:.1f}%")
-            mc4.metric("Más de 2.5 Goles", f"{pr.over_2_5_goals * 100:.1f}%")
+            st.markdown("##### 1. Mercado 1X2 Clásico & Goles Esperados (λ, μ)")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric(f"Victoria {h_sel}", f"{pr.home_win * 100:.1f}%")
+            m2.metric("Empate (X)", f"{pr.draw * 100:.1f}%")
+            m3.metric(f"Victoria {a_sel}", f"{pr.away_win * 100:.1f}%")
+            m4.metric(f"xG Local ({h_sel})", f"{pr.expected_home_goals:.2f}")
+            m5.metric(f"xG Visitante ({a_sel})", f"{pr.expected_away_goals:.2f}")
+
+            st.markdown("##### 2. Totales de Goles & Ambos Equipos Marcan (BTTS)")
+            g1, g2, g3, g4 = st.columns(4)
+            g1.metric("Más de 1.5 Goles", f"{pr.over_1_5_goals * 100:.1f}%")
+            g2.metric("Más de 2.5 Goles", f"{pr.over_2_5_goals * 100:.1f}%")
+            g3.metric("Más de 3.5 Goles", f"{pr.over_3_5_goals * 100:.1f}%")
+            g4.metric("Ambos Marcan (BTTS Sí)", f"{pr.btts_yes * 100:.1f}%")
+
+            st.markdown("##### 3. Hándicaps Asiáticos & Apuesta Sin Empate")
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Sin Empate (Local)", f"{pr.draw_no_bet['HOME'] * 100:.1f}%")
+            h2.metric("Sin Empate (Visitante)", f"{pr.draw_no_bet['AWAY'] * 100:.1f}%")
+            h3.metric(f"AH {h_sel} (-0.5)", f"{pr.asian_handicap['-0.5']['HOME'] * 100:.1f}%")
+            h4.metric(f"AH {h_sel} (+0.5)", f"{pr.asian_handicap['+0.5']['HOME'] * 100:.1f}%")
 
     # ==========================================
-    # PESTAÑA 3: BANKROLL TRACKER (P&L)
+    # PESTAÑA 3: BANKROLL TRACKER (P&L) & AUDITORÍA
     # ==========================================
     with tab_tracker:
-        st.subheader("Seguimiento Cuantitativo de Rendimiento (P&L)")
+        st.subheader("Seguimiento Cuantitativo de Rendimiento & Auditoría CLV")
 
         db = SessionLocal()
         try:
@@ -439,12 +416,26 @@ def render_dashboard():
 
             st.divider()
 
-            # Formulario para liquidar apuestas pendientes (con soporte para Closing Odds y CLV)
-            pending_bets = (
-                db.query(BetLog).filter(BetLog.status == "PENDING").all()
-            )
+            # Botones de automatización desatendida manual
+            act_col1, act_col2 = st.columns(2)
+            with act_col1:
+                if st.button("🔒 Capturar Cuotas de Cierre Ahora (Auditar CLV)", use_container_width=True):
+                    closing_svc = ClosingOddsService(db)
+                    n_aud = closing_svc.audit_pending_closing_odds(window_minutes=60)
+                    st.success(f"Cuotas de cierre auditadas: {n_aud}")
+                    st.rerun()
+
+            with act_col2:
+                if st.button("⚡ Liquidar Resultados Automáticamente", use_container_width=True):
+                    settle_svc = ResultSettlementService(db)
+                    n_set = settle_svc.settle_pending_bets()
+                    st.success(f"Apuestas finalizadas liquidadas: {n_set}")
+                    st.rerun()
+
+            # Formulario manual para liquidar apuestas pendientes
+            pending_bets = db.query(BetLog).filter(BetLog.status == "PENDING").all()
             if pending_bets:
-                st.write("#### ⏳ Liquidar Apuestas Pendientes")
+                st.write("#### ⏳ Liquidar Apuestas Pendientes Manualmente")
                 p_col1, p_col2, p_col3, p_col4 = st.columns([3, 1.5, 1.5, 2])
                 with p_col1:
                     bet_to_resolve = st.selectbox(
@@ -482,7 +473,7 @@ def render_dashboard():
                         st.rerun()
 
             # Tabla de Historial
-            st.write("#### 📋 Historial de Apuestas")
+            st.write("#### 📋 Historial de Apuestas y Rendimiento CLV")
             df_hist = bk_service.get_history_dataframe()
             if not df_hist.empty:
                 st.dataframe(df_hist, use_container_width=True)

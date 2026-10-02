@@ -1,0 +1,74 @@
+services:
+  # ---------------------------------------------
+  # 1. Base de Datos PostgreSQL 16
+  # ---------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: betting_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-betting_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-betting_pass}
+      POSTGRES_DB: ${DB_NAME:-betting_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-betting_user} -d ${DB_NAME:-betting_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------
+  # 2. Interfaz Visual Streamlit Dashboard
+  # ---------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: betting_streamlit
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      - DATABASE_URL=postgresql+pg8000://${DB_USER:-betting_user}:${DB_PASSWORD:-betting_pass}@db:5432/${DB_NAME:-betting_db}
+      - PYTHONUNBUFFERED=1
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    volumes:
+      - .:/app
+    command: ["streamlit", "run", "src/views/streamlit_view.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+  # ---------------------------------------------
+  # 3. Worker en Background (Daemon Desatendido)
+  # ---------------------------------------------
+  scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: betting_background_worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+pg8000://${DB_USER:-betting_user}:${DB_PASSWORD:-betting_pass}@db:5432/${DB_NAME:-betting_db}
+      - PYTHONUNBUFFERED=1
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - MIN_EDGE=0.04
+      - MIN_ODDS=1.60
+      - MAX_ODDS=3.50
+      - SCAN_INTERVAL_MINUTES=10
+      - XI_DECAY=0.0035
+    volumes:
+      - .:/app
+    command: ["python", "run_bot_scanner.py"]
+
+volumes:
+  pgdata:
+    driver: local

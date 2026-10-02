@@ -1,6 +1,6 @@
 # src/models/entities.py
 from datetime import datetime
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 from src.models.database import Base
 
@@ -51,11 +51,13 @@ class MarketOdds(Base):
 
   match = relationship("Match", back_populates="odds")
 
+
 class BetLog(Base):
   __tablename__ = "bet_logs"
 
   id = Column(Integer, primary_key=True, index=True)
   placed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+  kickoff_time = Column(DateTime(timezone=True), nullable=True)
   league = Column(String(50), nullable=False)
   match_name = Column(String(150), nullable=False)
   market = Column(String(100), nullable=False)
@@ -67,3 +69,21 @@ class BetLog(Base):
   profit_loss = Column(Float, default=0.0, nullable=False)
   resolved_at = Column(DateTime, nullable=True)
   closing_odds = Column(Float, nullable=True)
+
+
+class TeamParametersCache(Base):
+  """Caché persistente de parámetros Dixon-Coles (alpha, beta, gamma, rho)."""
+  __tablename__ = "team_parameters_cache"
+
+  id = Column(Integer, primary_key=True, autoincrement=True)
+  league = Column(String(100), nullable=False, index=True)
+  team_name = Column(String(100), nullable=False, index=True)
+  attack_rating = Column(Float, nullable=False)
+  defense_rating = Column(Float, nullable=False)
+  home_advantage = Column(Float, nullable=False, default=1.0)
+  rho = Column(Float, nullable=False, default=-0.11)
+  xi = Column(Float, nullable=False, default=0.0035)
+  use_xg = Column(Boolean, default=False)
+  xg_weight = Column(Float, default=0.0)
+  fitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+  expires_at = Column(DateTime, nullable=False)

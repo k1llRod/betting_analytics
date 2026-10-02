@@ -146,7 +146,7 @@ class MiCasinoScraper:
                 # Mercado Total de Goles (typeId == 18)
                 elif type_id == 18 and len(odd_ids) >= 2:
                     try:
-                        line_val = float(market.get("sv", "2.5"))
+                        line_val = float(str(market.get("sv", "2.5")).replace(",", "."))
                     except ValueError:
                         line_val = 2.5
 
@@ -176,6 +176,112 @@ class MiCasinoScraper:
                                 line=line_val,
                                 selection="UNDER",
                                 price=float(o_under["price"]),
+                            )
+                        )
+
+                # Mercado Ambos Equipos Marcan (BTTS, typeId == 29)
+                elif type_id == 29 and len(odd_ids) >= 2:
+                    o_yes = odds_lookup.get(odd_ids[0])
+                    o_no = odds_lookup.get(odd_ids[1])
+
+                    if o_yes and o_no:
+                        scraped.append(
+                            ScrapedMarket(
+                                event_name=raw_name,
+                                home_team=home_team,
+                                away_team=away_team,
+                                start_date=start_date,
+                                market_type="BTTS",
+                                line=None,
+                                selection="YES",
+                                price=float(o_yes["price"]),
+                            )
+                        )
+                        scraped.append(
+                            ScrapedMarket(
+                                event_name=raw_name,
+                                home_team=home_team,
+                                away_team=away_team,
+                                start_date=start_date,
+                                market_type="BTTS",
+                                line=None,
+                                selection="NO",
+                                price=float(o_no["price"]),
+                            )
+                        )
+
+                # Mercado Apuesta Sin Empate / Draw No Bet (typeId == 11, AH 0.0)
+                elif type_id == 11 and len(odd_ids) >= 2:
+                    o_dnb_home = odds_lookup.get(odd_ids[0])
+                    o_dnb_away = odds_lookup.get(odd_ids[1])
+
+                    if o_dnb_home and o_dnb_away:
+                        scraped.append(
+                            ScrapedMarket(
+                                event_name=raw_name,
+                                home_team=home_team,
+                                away_team=away_team,
+                                start_date=start_date,
+                                market_type="DRAW_NO_BET",
+                                line=0.0,
+                                selection="HOME",
+                                price=float(o_dnb_home["price"]),
+                            )
+                        )
+                        scraped.append(
+                            ScrapedMarket(
+                                event_name=raw_name,
+                                home_team=home_team,
+                                away_team=away_team,
+                                start_date=start_date,
+                                market_type="DRAW_NO_BET",
+                                line=0.0,
+                                selection="AWAY",
+                                price=float(o_dnb_away["price"]),
+                            )
+                        )
+
+                # Mercado Doble Oportunidad (typeId == 10, AH +0.5)
+                elif type_id == 10 and len(odd_ids) >= 3:
+                    o_1x = odds_lookup.get(odd_ids[0])
+                    o_12 = odds_lookup.get(odd_ids[1])
+                    o_x2 = odds_lookup.get(odd_ids[2])
+
+                    if o_1x and o_12 and o_x2:
+                        scraped.append(
+                            ScrapedMarket(
+                                event_name=raw_name,
+                                home_team=home_team,
+                                away_team=away_team,
+                                start_date=start_date,
+                                market_type="DOUBLE_CHANCE",
+                                line=0.5,
+                                selection="1X",
+                                price=float(o_1x["price"]),
+                            )
+                        )
+                        scraped.append(
+                            ScrapedMarket(
+                                event_name=raw_name,
+                                home_team=home_team,
+                                away_team=away_team,
+                                start_date=start_date,
+                                market_type="DOUBLE_CHANCE",
+                                line=None,
+                                selection="12",
+                                price=float(o_12["price"]),
+                            )
+                        )
+                        scraped.append(
+                            ScrapedMarket(
+                                event_name=raw_name,
+                                home_team=home_team,
+                                away_team=away_team,
+                                start_date=start_date,
+                                market_type="DOUBLE_CHANCE",
+                                line=0.5,
+                                selection="X2",
+                                price=float(o_x2["price"]),
                             )
                         )
 

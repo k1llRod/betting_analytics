@@ -20,9 +20,11 @@ class BankrollService:
         p_model: float,
         edge: float,
         stake: float,
+        kickoff_time: Optional[datetime] = None,
     ) -> BetLog:
         bet = BetLog(
             placed_at=datetime.utcnow(),
+            kickoff_time=kickoff_time,
             league=str(league),
             match_name=str(match_name),
             market=str(market),

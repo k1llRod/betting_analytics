@@ -9,7 +9,7 @@ class EVCalculator:
         :return: Implied probability as a float
         """
         if odds <= 1.0:
-            raise ValueError("La couta debe ser mayor a 1.0.")
+            return 1.0
         return 1.0 / odds
 
     @staticmethod
